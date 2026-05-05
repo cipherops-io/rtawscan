@@ -4,13 +4,18 @@ import (
 	"encoding/json"
 	"fmt"
 	"os"
+	"regexp"
 	"strings"
 
 	"github.com/aws/aws-sdk-go-v2/aws"
 	"github.com/cipherops-io/rsvcmodel"
 )
 
-func GenerateHTML(jsonFile string) error {
+func GenerateHTML() error {
+	jsonFile := os.Getenv("TS_SCAN_JSON")
+	if jsonFile == "" {
+		return fmt.Errorf("TS_SCAN_JSON environment variable is not set")
+	}
 	data, err := os.ReadFile(jsonFile)
 	if err != nil {
 		return fmt.Errorf("file %s not found. Run fetch mode first", jsonFile)
@@ -33,7 +38,7 @@ func generateHTMLTable(findings []*rsvcmodel.Finding) string {
 	sb.WriteString(".crit { color: red; font-weight: bold; }")
 	sb.WriteString("a { color: #0066cc; text-decoration: none; }")
 	sb.WriteString("</style></head><body>")
-	sb.WriteString("<table><tr><th>Segment</th><th>Category</th><th>Finding</th><th>Severity</th><th>Resource Name</th><th>Resource ID</th></tr>")
+	sb.WriteString("<table><tr><th>Segment</th><th>Category</th><th>Finding</th><th>Severity</th><th>Resource Name</th></tr>")
 
 	for _, f := range findings {
 		sevClass := ""
@@ -51,18 +56,12 @@ func generateHTMLTable(findings []*rsvcmodel.Finding) string {
 				}
 			}
 
-			resourceID := ""
-			if i < len(f.ResourceIDs) {
-				resourceID = f.ResourceIDs[i]
-			}
-
 			sb.WriteString("<tr>")
 			sb.WriteString(fmt.Sprintf("<td>%s</td>", f.Segment))
 			sb.WriteString(fmt.Sprintf("<td>%s</td>", f.Category))
 			sb.WriteString(fmt.Sprintf("<td>%s</td>", f.Title))
 			sb.WriteString(fmt.Sprintf("<td%s>%s</td>", sevClass, f.Severity))
 			sb.WriteString(fmt.Sprintf("<td><a href='%s' target='_blank'>%s</a></td>", link, item))
-			sb.WriteString(fmt.Sprintf("<td><code>%s</code></td>", resourceID))
 			sb.WriteString("</tr>")
 		}
 	}
@@ -70,12 +69,19 @@ func generateHTMLTable(findings []*rsvcmodel.Finding) string {
 	return sb.String()
 }
 
+// regionPattern matches AWS region strings like us-east-1, ap-south-1, eu-west-2, etc.
+var regionPattern = regexp.MustCompile(`^[a-z]{2}(-[a-z]+-\d+)$`)
+
 func findPrettyName(headers []*string, metadata []*string, fallback string) string {
 	for i, hPtr := range headers {
 		h := strings.ToLower(aws.ToString(hPtr))
-		if i < len(metadata) && (strings.Contains(h, "name") || strings.Contains(h, "user") || strings.Contains(h, "domain") || h == "resource" || strings.Contains(h, "function")) {
+		// Skip headers that are clearly region/location fields
+		if strings.Contains(h, "region") || strings.Contains(h, "location") || strings.Contains(h, "zone") || strings.Contains(h, "status") {
+			continue
+		}
+		if i < len(metadata) && (strings.Contains(h, "name") || strings.Contains(h, "user") || strings.Contains(h, "domain") || h == "resource" || strings.Contains(h, "function") || strings.Contains(h, "bucket")) {
 			val := aws.ToString(metadata[i])
-			if val != "" && !strings.Contains(val, "us-east") && !strings.Contains(val, "us-west") {
+			if val != "" && !regionPattern.MatchString(val) {
 				return val
 			}
 		}

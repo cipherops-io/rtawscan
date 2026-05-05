@@ -54,11 +54,25 @@ func TestFindPrettyName(t *testing.T) {
 			expected: "alice",
 		},
 		{
-			name:     "Ignores regions as pretty name",
+			name:     "Ignores exact region values",
+			headers:  []*string{aws.String("Bucket Name")},
+			metadata: []*string{aws.String("ap-south-1")},
+			fallback: "fallback-id",
+			expected: "fallback-id", // skips because ap-south-1 is a region
+		},
+		{
+			name:     "Allows domain containing region substring",
 			headers:  []*string{aws.String("Domain Name")},
 			metadata: []*string{aws.String("us-east-1-domain")},
 			fallback: "fallback-id",
-			expected: "fallback-id", // skips because it contains us-east
+			expected: "us-east-1-domain", // not an exact region match, so allowed
+		},
+		{
+			name:     "Skips Region Name header entirely",
+			headers:  []*string{aws.String("Region Name"), aws.String("Bucket Name")},
+			metadata: []*string{aws.String("ap-south-1"), aws.String("my-bucket")},
+			fallback: "fallback-id",
+			expected: "my-bucket", // skips "Region Name" header, finds "Bucket Name"
 		},
 		{
 			name:     "Fallback when no match",
@@ -112,7 +126,6 @@ func TestGenerateHTMLTable(t *testing.T) {
 		"<td>S3 Bucket Public Access</td>",
 		"<td class='crit'>critical</td>",
 		"<td><a href='https://s3.console.aws.amazon.com/s3/buckets/public-bucket' target='_blank'>public-bucket</a></td>",
-		"<td><code>arn:aws:s3:::public-bucket</code></td>",
 	}
 
 	for _, str := range expectedStrings {
