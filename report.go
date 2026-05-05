@@ -11,7 +11,11 @@ import (
 	"github.com/cipherops-io/rsvcmodel"
 )
 
-func GenerateHTML(jsonFile string) error {
+func GenerateHTML() error {
+	jsonFile := os.Getenv("TS_SCAN_JSON")
+	if jsonFile == "" {
+		return fmt.Errorf("TS_SCAN_JSON environment variable is not set")
+	}
 	data, err := os.ReadFile(jsonFile)
 	if err != nil {
 		return fmt.Errorf("file %s not found. Run fetch mode first", jsonFile)
