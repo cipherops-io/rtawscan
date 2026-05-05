@@ -38,7 +38,7 @@ func generateHTMLTable(findings []*rsvcmodel.Finding) string {
 	sb.WriteString(".crit { color: red; font-weight: bold; }")
 	sb.WriteString("a { color: #0066cc; text-decoration: none; }")
 	sb.WriteString("</style></head><body>")
-	sb.WriteString("<table><tr><th>Segment</th><th>Category</th><th>Finding</th><th>Severity</th><th>Resource Name</th><th>Resource ID</th></tr>")
+	sb.WriteString("<table><tr><th>Segment</th><th>Category</th><th>Finding</th><th>Severity</th><th>Resource Name</th></tr>")
 
 	for _, f := range findings {
 		sevClass := ""
@@ -56,18 +56,12 @@ func generateHTMLTable(findings []*rsvcmodel.Finding) string {
 				}
 			}
 
-			resourceID := ""
-			if i < len(f.ResourceIDs) {
-				resourceID = f.ResourceIDs[i]
-			}
-
 			sb.WriteString("<tr>")
 			sb.WriteString(fmt.Sprintf("<td>%s</td>", f.Segment))
 			sb.WriteString(fmt.Sprintf("<td>%s</td>", f.Category))
 			sb.WriteString(fmt.Sprintf("<td>%s</td>", f.Title))
 			sb.WriteString(fmt.Sprintf("<td%s>%s</td>", sevClass, f.Severity))
 			sb.WriteString(fmt.Sprintf("<td><a href='%s' target='_blank'>%s</a></td>", link, item))
-			sb.WriteString(fmt.Sprintf("<td><code>%s</code></td>", resourceID))
 			sb.WriteString("</tr>")
 		}
 	}

@@ -126,7 +126,6 @@ func TestGenerateHTMLTable(t *testing.T) {
 		"<td>S3 Bucket Public Access</td>",
 		"<td class='crit'>critical</td>",
 		"<td><a href='https://s3.console.aws.amazon.com/s3/buckets/public-bucket' target='_blank'>public-bucket</a></td>",
-		"<td><code>arn:aws:s3:::public-bucket</code></td>",
 	}
 
 	for _, str := range expectedStrings {
