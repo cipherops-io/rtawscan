@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"os"
+	"regexp"
 	"strings"
 
 	"github.com/aws/aws-sdk-go-v2/aws"
@@ -70,12 +71,19 @@ func generateHTMLTable(findings []*rsvcmodel.Finding) string {
 	return sb.String()
 }
 
+// regionPattern matches AWS region strings like us-east-1, ap-south-1, eu-west-2, etc.
+var regionPattern = regexp.MustCompile(`^[a-z]{2}(-[a-z]+-\d+)$`)
+
 func findPrettyName(headers []*string, metadata []*string, fallback string) string {
 	for i, hPtr := range headers {
 		h := strings.ToLower(aws.ToString(hPtr))
-		if i < len(metadata) && (strings.Contains(h, "name") || strings.Contains(h, "user") || strings.Contains(h, "domain") || h == "resource" || strings.Contains(h, "function")) {
+		// Skip headers that are clearly region/location fields
+		if strings.Contains(h, "region") || strings.Contains(h, "location") || strings.Contains(h, "zone") || strings.Contains(h, "status") {
+			continue
+		}
+		if i < len(metadata) && (strings.Contains(h, "name") || strings.Contains(h, "user") || strings.Contains(h, "domain") || h == "resource" || strings.Contains(h, "function") || strings.Contains(h, "bucket")) {
 			val := aws.ToString(metadata[i])
-			if val != "" && !strings.Contains(val, "us-east") && !strings.Contains(val, "us-west") {
+			if val != "" && !regionPattern.MatchString(val) {
 				return val
 			}
 		}
