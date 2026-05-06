@@ -21,9 +21,8 @@ func isSubscriptionError(err error) bool {
 	if err == nil {
 		return false
 	}
-	var apiErr smithy.APIError
 	// Unwrap the error to check if it's an AWS API error
-	if errors.As(err, &apiErr) {
+	if apiErr, ok := errors.AsType[smithy.APIError](err); ok {
 		// Check the specific error code
 		if apiErr.ErrorCode() == "SubscriptionRequiredException" {
 			return true
@@ -50,7 +49,6 @@ func FetchAWS() (bool, error) {
 		return trustedAdv, err
 	}
 	trustedAdv = true
-	fmt.Println("Fetching from AWS Trusted advisor (estimated ~18s)...")
 	resultsChan := make(chan *rsvcmodel.Finding, len(checksResp.Checks))
 	var wg sync.WaitGroup
 	semaphore := make(chan struct{}, 10)
