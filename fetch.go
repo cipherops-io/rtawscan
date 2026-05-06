@@ -21,9 +21,8 @@ func isSubscriptionError(err error) bool {
 	if err == nil {
 		return false
 	}
-	var apiErr smithy.APIError
 	// Unwrap the error to check if it's an AWS API error
-	if errors.As(err, &apiErr) {
+	if apiErr, ok := errors.AsType[smithy.APIError](err); ok {
 		// Check the specific error code
 		if apiErr.ErrorCode() == "SubscriptionRequiredException" {
 			return true
@@ -50,7 +49,6 @@ func FetchAWS() (bool, error) {
 		return trustedAdv, err
 	}
 	trustedAdv = true
-	fmt.Println("Fetching from AWS Trusted advisor (estimated ~18s)...")
 	resultsChan := make(chan *rsvcmodel.Finding, len(checksResp.Checks))
 	var wg sync.WaitGroup
 	semaphore := make(chan struct{}, 10)
@@ -105,9 +103,11 @@ func FetchAWS() (bool, error) {
 			finding := rsvcmodel.NewFinding(segment, checkTitle, category, items)
 			finding.Severity = severity
 			finding.Provider = "aws"
+			finding.Summary = aws.ToString(c.Description)
 			finding.ResourceIDs = resourceIDs
 			finding.Metadata = map[string]any{
-				"links": links,
+				"links":   links,
+				"service": extractService(checkTitle),
 			}
 
 			resultsChan <- finding
@@ -139,88 +139,115 @@ func mapCategoryToSegment(category string) rsvcmodel.Segment {
 	}
 }
 
+const defaultRegion = "us-east-1"
+const trustedAdvisorURL = "https://console.aws.amazon.com/trustedadvisor/home?region=us-east-1#/dashboard"
+
 func buildDeepLink(checkName, resourceID, prettyID string, metadata map[string]any) string {
-	var region string
-	regionKeys := []string{"Region", "Resource Region", "Location", "Region Name"}
-	for _, k := range regionKeys {
-		if val, ok := metadata[k].(string); ok && val != "" {
-			region = val
-			break
-		}
-	}
-	if region == "" {
-		region = "us-east-1"
+	region := resolveRegion(metadata)
+	id := resourceID
+
+	if link := buildARNLink(id, region); link != "" {
+		return link
 	}
 
 	name := strings.ToLower(checkName)
-	id := resourceID
-
-	if strings.HasPrefix(id, "arn:aws:") {
-		parts := strings.Split(id, ":")
-		if len(parts) > 5 {
-			service := parts[2]
-			switch service {
-			case "s3":
-				bucket := strings.Split(parts[5], "/")[0]
-				return fmt.Sprintf("https://s3.console.aws.amazon.com/s3/buckets/%s", bucket)
-			case "iam":
-				return "https://console.aws.amazon.com/iam/home#/roles"
-			case "kms":
-				keyID := parts[5]
-				if strings.HasPrefix(keyID, "key/") {
-					keyID = strings.TrimPrefix(keyID, "key/")
-				}
-				return fmt.Sprintf("https://%s.console.aws.amazon.com/kms/home?region=%s#/kms/keys/%s", region, region, keyID)
-			case "lambda":
-				if len(parts) > 6 {
-					functionName := parts[6]
-					return fmt.Sprintf("https://%s.console.aws.amazon.com/lambda/home?region=%s#/functions/%s", region, region, functionName)
-				}
-			}
-		}
-	}
-
 	switch {
 	case strings.Contains(name, "s3"):
-		bucket := prettyID
-		if bucket == "" {
-			bucket = id
-		}
-		return fmt.Sprintf("https://s3.console.aws.amazon.com/s3/buckets/%s?region=%s", bucket, region)
+		return buildS3Link(prettyID, id, region)
 	case strings.Contains(name, "ec2") || strings.Contains(name, "ebs"):
-		if strings.HasPrefix(id, "i-") {
-			return fmt.Sprintf("https://%s.console.aws.amazon.com/ec2/v2/home?region=%s#InstanceDetails:instanceId=%s", region, region, id)
-		}
-		if strings.HasPrefix(id, "vol-") {
-			return fmt.Sprintf("https://%s.console.aws.amazon.com/ec2/v2/home?region=%s#VolumeDetails:volumeId=%s", region, region, id)
-		}
+		return buildEC2Link(id, region)
 	case strings.Contains(name, "rds"):
 		return fmt.Sprintf("https://%s.console.aws.amazon.com/rds/home?region=%s#database:id=%s", region, region, id)
 	case strings.Contains(name, "iam"):
-		user := prettyID
-		if user == "" || user == id || user == "N/A" {
-			if u, ok := metadata["User Name"].(string); ok && u != "" {
-				user = u
-			} else if u, ok := metadata["IAM User"].(string); ok && u != "" {
-				user = u
-			}
-		}
-		if user != "" && user != id && user != "N/A" {
-			return fmt.Sprintf("https://console.aws.amazon.com/iam/home?#/users/%s", user)
-		}
-		return "https://console.aws.amazon.com/iam/home?#/users"
+		return buildIAMLink(prettyID, id, metadata)
 	case strings.Contains(name, "lambda"):
-		function := prettyID
-		if function == "" || function == "N/A" {
-			function = id
-		}
-		if strings.HasPrefix(function, "arn:aws:lambda:") {
-			parts := strings.Split(function, ":")
-			if len(parts) > 6 {
-				function = parts[6]
-			}
-		}
-		return fmt.Sprintf("https://%s.console.aws.amazon.com/lambda/home?region=%s#/functions/%s", region, region, function)
+		return buildLambdaLink(prettyID, id, region)
 	}
-	return "https://console.aws.amazon.com/trustedadvisor/home?region=us-east-1#/dashboard"
+	return trustedAdvisorURL
+}
+
+func resolveRegion(metadata map[string]any) string {
+	for _, k := range []string{"Region", "Resource Region", "Location", "Region Name"} {
+		if val, ok := metadata[k].(string); ok && val != "" {
+			return val
+		}
+	}
+	return defaultRegion
+}
+
+func buildARNLink(id, region string) string {
+	if !strings.HasPrefix(id, "arn:aws:") {
+		return ""
+	}
+	parts := strings.Split(id, ":")
+	if len(parts) <= 5 {
+		return ""
+	}
+	switch parts[2] {
+	case "s3":
+		bucket := strings.Split(parts[5], "/")[0]
+		return fmt.Sprintf("https://s3.console.aws.amazon.com/s3/buckets/%s", bucket)
+	case "iam":
+		return "https://console.aws.amazon.com/iam/home#/roles"
+	case "kms":
+		keyID := strings.TrimPrefix(parts[5], "key/")
+		return fmt.Sprintf("https://%s.console.aws.amazon.com/kms/home?region=%s#/kms/keys/%s", region, region, keyID)
+	case "lambda":
+		if len(parts) > 6 {
+			return fmt.Sprintf("https://%s.console.aws.amazon.com/lambda/home?region=%s#/functions/%s", region, region, parts[6])
+		}
+	}
+	return ""
+}
+
+func buildS3Link(prettyID, id, region string) string {
+	bucket := prettyID
+	if bucket == "" {
+		bucket = id
+	}
+	return fmt.Sprintf("https://s3.console.aws.amazon.com/s3/buckets/%s?region=%s", bucket, region)
+}
+
+func buildEC2Link(id, region string) string {
+	if strings.HasPrefix(id, "i-") {
+		return fmt.Sprintf("https://%s.console.aws.amazon.com/ec2/v2/home?region=%s#InstanceDetails:instanceId=%s", region, region, id)
+	}
+	if strings.HasPrefix(id, "vol-") {
+		return fmt.Sprintf("https://%s.console.aws.amazon.com/ec2/v2/home?region=%s#VolumeDetails:volumeId=%s", region, region, id)
+	}
+	return trustedAdvisorURL
+}
+
+func buildIAMLink(prettyID, id string, metadata map[string]any) string {
+	user := resolveUser(prettyID, id, metadata)
+	if user != "" && user != id && user != "N/A" {
+		return fmt.Sprintf("https://console.aws.amazon.com/iam/home?#/users/%s", user)
+	}
+	return "https://console.aws.amazon.com/iam/home?#/users"
+}
+
+func resolveUser(prettyID, id string, metadata map[string]any) string {
+	if prettyID != "" && prettyID != id && prettyID != "N/A" {
+		return prettyID
+	}
+	for _, key := range []string{"User Name", "IAM User"} {
+		if u, ok := metadata[key].(string); ok && u != "" {
+			return u
+		}
+	}
+	return prettyID
+}
+
+func buildLambdaLink(prettyID, id, region string) string {
+	function := prettyID
+	if function == "" || function == "N/A" {
+		function = id
+	}
+	if strings.HasPrefix(function, "arn:aws:lambda:") {
+		parts := strings.Split(function, ":")
+		if len(parts) > 6 {
+			function = parts[6]
+		}
+	}
+	return fmt.Sprintf("https://%s.console.aws.amazon.com/lambda/home?region=%s#/functions/%s", region, region, function)
 }
