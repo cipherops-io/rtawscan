@@ -2,7 +2,6 @@ package rtawscan
 
 import (
 	"context"
-	"encoding/json"
 	"errors"
 	"fmt"
 	"strings"
@@ -17,6 +16,9 @@ import (
 	"github.com/cipherops-io/rsvcmodel"
 )
 
+// isSubscriptionError checks if the given AWS error indicates that the account
+// does not have the required AWS Support subscription plan (Business/Enterprise)
+// to access the Trusted Advisor API.
 func isSubscriptionError(err error) bool {
 	if err == nil {
 		return false
@@ -30,12 +32,17 @@ func isSubscriptionError(err error) bool {
 	}
 	return false
 }
-func FetchAWS() (bool, error) {
+
+// FetchAWS queries the AWS Trusted Advisor API for security, cost, and
+// observability findings. It returns a boolean indicating if Trusted Advisor
+// is enabled (i.e. has the required support subscription), a list of findings,
+// and any non-subscription errors encountered.
+func FetchAWS() (bool, []*rsvcmodel.Finding, error) {
 	trustedAdv := false
 	ctx := context.TODO()
 	cfg, err := config.LoadDefaultConfig(ctx, config.WithRegion("us-east-1"))
 	if err != nil {
-		return trustedAdv, err
+		return trustedAdv, nil, err
 	}
 	client := support.NewFromConfig(cfg)
 
@@ -44,9 +51,9 @@ func FetchAWS() (bool, error) {
 	})
 	if err != nil {
 		if isSubscriptionError(err) {
-			return trustedAdv, nil
+			return trustedAdv, nil, err
 		}
-		return trustedAdv, err
+		return trustedAdv, nil, err
 	}
 	trustedAdv = true
 	resultsChan := make(chan *rsvcmodel.Finding, len(checksResp.Checks))
@@ -114,20 +121,21 @@ func FetchAWS() (bool, error) {
 		}(check)
 	}
 
-	go func() { wg.Wait(); close(resultsChan) }()
+	// Wait for all goroutines to finish
+	go func() {
+		wg.Wait()
+		close(resultsChan)
+	}()
 
 	var allFindings []*rsvcmodel.Finding
 	for f := range resultsChan {
 		allFindings = append(allFindings, f)
 	}
 
-	jsonBytes, _ := json.MarshalIndent(allFindings, "", "  ")
-	//fmt.Printf("SUCCESS: Report saved to %s\n", outputFile)
-	fmt.Println(string(jsonBytes))
-	//return os.WriteFile(outputFile, jsonBytes, 0644)
-	return trustedAdv, nil
+	return trustedAdv, allFindings, err
 }
 
+// mapCategoryToSegment maps Trusted Advisor categories to rsvcmodel segments.
 func mapCategoryToSegment(category string) rsvcmodel.Segment {
 	switch strings.ToLower(category) {
 	case "cost_optimizing":
@@ -142,6 +150,9 @@ func mapCategoryToSegment(category string) rsvcmodel.Segment {
 const defaultRegion = "us-east-1"
 const trustedAdvisorURL = "https://console.aws.amazon.com/trustedadvisor/home?region=us-east-1#/dashboard"
 
+// buildDeepLink attempts to generate a direct AWS Console link for the affected
+// resource based on its service, ID, and metadata. It falls back to the Trusted
+// Advisor dashboard if a specific deep link cannot be determined.
 func buildDeepLink(checkName, resourceID, prettyID string, metadata map[string]any) string {
 	region := resolveRegion(metadata)
 	id := resourceID
@@ -166,6 +177,8 @@ func buildDeepLink(checkName, resourceID, prettyID string, metadata map[string]a
 	return trustedAdvisorURL
 }
 
+// resolveRegion extracts the AWS region from Trusted Advisor metadata,
+// falling back to "us-east-1" if not found.
 func resolveRegion(metadata map[string]any) string {
 	for _, k := range []string{"Region", "Resource Region", "Location", "Region Name"} {
 		if val, ok := metadata[k].(string); ok && val != "" {
@@ -175,6 +188,8 @@ func resolveRegion(metadata map[string]any) string {
 	return defaultRegion
 }
 
+// buildARNLink attempts to construct a deep link purely by parsing the
+// structure of an AWS ARN.
 func buildARNLink(id, region string) string {
 	if !strings.HasPrefix(id, "arn:aws:") {
 		return ""
@@ -200,6 +215,7 @@ func buildARNLink(id, region string) string {
 	return ""
 }
 
+// buildS3Link generates a console link for an S3 bucket.
 func buildS3Link(prettyID, id, region string) string {
 	bucket := prettyID
 	if bucket == "" {
@@ -208,6 +224,7 @@ func buildS3Link(prettyID, id, region string) string {
 	return fmt.Sprintf("https://s3.console.aws.amazon.com/s3/buckets/%s?region=%s", bucket, region)
 }
 
+// buildEC2Link generates a console link for EC2 instances or EBS volumes.
 func buildEC2Link(id, region string) string {
 	if strings.HasPrefix(id, "i-") {
 		return fmt.Sprintf("https://%s.console.aws.amazon.com/ec2/v2/home?region=%s#InstanceDetails:instanceId=%s", region, region, id)
@@ -218,6 +235,7 @@ func buildEC2Link(id, region string) string {
 	return trustedAdvisorURL
 }
 
+// buildIAMLink generates a console link for an IAM user or the IAM dashboard.
 func buildIAMLink(prettyID, id string, metadata map[string]any) string {
 	user := resolveUser(prettyID, id, metadata)
 	if user != "" && user != id && user != "N/A" {
@@ -226,6 +244,8 @@ func buildIAMLink(prettyID, id string, metadata map[string]any) string {
 	return "https://console.aws.amazon.com/iam/home?#/users"
 }
 
+// resolveUser attempts to extract a valid IAM username from the finding's
+// pretty ID, raw ID, or metadata map.
 func resolveUser(prettyID, id string, metadata map[string]any) string {
 	if prettyID != "" && prettyID != id && prettyID != "N/A" {
 		return prettyID
@@ -238,6 +258,7 @@ func resolveUser(prettyID, id string, metadata map[string]any) string {
 	return prettyID
 }
 
+// buildLambdaLink generates a console link for a Lambda function.
 func buildLambdaLink(prettyID, id, region string) string {
 	function := prettyID
 	if function == "" || function == "N/A" {
