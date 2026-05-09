@@ -42,7 +42,7 @@ import (
 
 func main() {
 	// Fetch findings from AWS Trusted Advisor
-	trustedAdvAvailable, err := rtawscan.FetchAWS()
+	trustedAdvAvailable, err := rtawscan.FetchTrustedAdvisorFindings()
 	if err != nil {
 		log.Fatalf("Failed to fetch AWS Trusted Advisor data: %v", err)
 	}
@@ -104,7 +104,7 @@ func main() {
 
 // FetchWithClient fetches findings using a pre-configured AWS client
 func FetchWithClient(ctx context.Context, client *support.Support) ([]*rsvcmodel.Finding, error) {
-	// Implementation would follow similar pattern to FetchAWS but use provided client
+	// Implementation would follow similar pattern to FetchTrustedAdvisorFindings but use provided client
 	// This is a simplified example - see source code for full implementation
 	return nil, nil
 }

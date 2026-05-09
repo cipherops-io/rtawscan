@@ -86,8 +86,8 @@ func findPrettyName(headers []*string, metadata []*string, fallback string) stri
 			continue
 		}
 		if i < len(metadata) && (strings.Contains(h, "name") || strings.Contains(h, "user") || strings.Contains(h, "domain") || h == "resource" || strings.Contains(h, "function") || strings.Contains(h, "bucket")) {
-			val := aws.ToString(metadata[i])
-			if val != "" && !regionPattern.MatchString(val) {
+			val := strings.TrimSpace(aws.ToString(metadata[i]))
+			if val != "" && val != "-" && val != "N/A" && !regionPattern.MatchString(val) {
 				return val
 			}
 		}
