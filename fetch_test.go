@@ -3,7 +3,99 @@ package rtawscan
 import (
 	"strings"
 	"testing"
+
+	"github.com/aws/aws-sdk-go-v2/aws"
 )
+
+func TestResolveResourceID(t *testing.T) {
+	tests := []struct {
+		name     string
+		headers  []*string
+		metadata []*string
+		fallback string
+		expected string
+	}{
+		{
+			name:     "EBS Volume ID extracted",
+			headers:  []*string{aws.String("Status"), aws.String("Region"), aws.String("Volume ID"), aws.String("Volume Name")},
+			metadata: []*string{aws.String("warning"), aws.String("us-east-1"), aws.String("vol-0abc123def456"), aws.String("my-volume")},
+			fallback: "tGgFXj8sRanBcMfKsCWpXxv8mWPcyOE4lJvG1NHkbkk",
+			expected: "vol-0abc123def456",
+		},
+		{
+			name:     "EBS Volume ID no name tag",
+			headers:  []*string{aws.String("Status"), aws.String("Region"), aws.String("Volume ID"), aws.String("Volume Name")},
+			metadata: []*string{aws.String("warning"), aws.String("us-east-1"), aws.String("vol-0abc123def456"), aws.String("-")},
+			fallback: "tGgFXj8sRanBcMfKsCWpXxv8mWPcyOE4lJvG1NHkbkk",
+			expected: "vol-0abc123def456",
+		},
+		{
+			name:     "EC2 Instance ID extracted",
+			headers:  []*string{aws.String("Status"), aws.String("Region"), aws.String("Instance ID"), aws.String("Instance Name")},
+			metadata: []*string{aws.String("warning"), aws.String("us-west-2"), aws.String("i-0123456789abcdef0"), aws.String("web-server")},
+			fallback: "hashedvalue",
+			expected: "i-0123456789abcdef0",
+		},
+		{
+			name:     "Access Analyzer resource extracted",
+			headers:  []*string{aws.String("Status"), aws.String("Region"), aws.String("Resource")},
+			metadata: []*string{aws.String("warning"), aws.String("us-east-1"), aws.String("arn:aws:s3:::my-bucket")},
+			fallback: "hashedvalue",
+			expected: "arn:aws:s3:::my-bucket",
+		},
+		{
+			name:     "Elastic IP address extracted",
+			headers:  []*string{aws.String("Region"), aws.String("IP Address")},
+			metadata: []*string{aws.String("us-east-1"), aws.String("54.210.167.204")},
+			fallback: "tGgFXj8sRanBcMfKsCWpXxv8mWPcyOE4lJvG1NHkbkk",
+			expected: "54.210.167.204",
+		},
+		{
+			name:     "Target group ARN extracted",
+			headers:  []*string{aws.String("Status"), aws.String("Region"), aws.String("Target Group ARN")},
+			metadata: []*string{aws.String("warning"), aws.String("us-east-1"), aws.String("arn:aws:elasticloadbalancing:us-east-1:123:targetgroup/my-tg/abc")},
+			fallback: "hashedvalue",
+			expected: "arn:aws:elasticloadbalancing:us-east-1:123:targetgroup/my-tg/abc",
+		},
+		{
+			name:     "Load balancer ARN extracted",
+			headers:  []*string{aws.String("Status"), aws.String("Region"), aws.String("Load Balancer ARN")},
+			metadata: []*string{aws.String("warning"), aws.String("us-east-1"), aws.String("arn:aws:elasticloadbalancing:us-east-1:123:loadbalancer/app/my-alb/abc")},
+			fallback: "hashedvalue",
+			expected: "arn:aws:elasticloadbalancing:us-east-1:123:loadbalancer/app/my-alb/abc",
+		},
+		{
+			name:     "Falls back when ID column is placeholder",
+			headers:  []*string{aws.String("Status"), aws.String("Volume ID")},
+			metadata: []*string{aws.String("warning"), aws.String("N/A")},
+			fallback: "hashedvalue",
+			expected: "hashedvalue",
+		},
+		{
+			name:     "Falls back when no known ID header present",
+			headers:  []*string{aws.String("Status"), aws.String("Region"), aws.String("Reason")},
+			metadata: []*string{aws.String("warning"), aws.String("us-east-1"), aws.String("something")},
+			fallback: "hashedvalue",
+			expected: "hashedvalue",
+		},
+		{
+			name:     "Falls back when metadata index out of range",
+			headers:  []*string{aws.String("Volume ID")},
+			metadata: []*string{},
+			fallback: "hashedvalue",
+			expected: "hashedvalue",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			result := resolveResourceID(tt.headers, tt.metadata, tt.fallback)
+			if result != tt.expected {
+				t.Errorf("expected %q, got %q", tt.expected, result)
+			}
+		})
+	}
+}
 
 func TestBuildDeepLink(t *testing.T) {
 	tests := []struct {
@@ -53,6 +145,30 @@ func TestBuildDeepLink(t *testing.T) {
 			prettyID:   "my-actual-bucket",
 			metadata:   map[string]any{"Region": "ap-south-1"},
 			expected:   "https://s3.console.aws.amazon.com/s3/buckets/my-actual-bucket?region=ap-south-1",
+		},
+		{
+			name:       "ALB target group ARN",
+			checkName:  "Application Load Balancer Target Groups encrypted protocol",
+			resourceID: "arn:aws:elasticloadbalancing:us-east-1:123456789012:targetgroup/my-tg/abc123",
+			prettyID:   "my-tg",
+			metadata:   map[string]any{"Region": "us-east-1"},
+			expected:   "https://us-east-1.console.aws.amazon.com/ec2/v2/home?region=us-east-1#TargetGroups:search=my-tg",
+		},
+		{
+			name:       "ALB load balancer ARN",
+			checkName:  "Application Load Balancer Request Routing",
+			resourceID: "arn:aws:elasticloadbalancing:eu-west-1:123456789012:loadbalancer/app/my-alb/abc123",
+			prettyID:   "my-alb",
+			metadata:   map[string]any{"Region": "eu-west-1"},
+			expected:   "https://eu-west-1.console.aws.amazon.com/ec2/v2/home?region=eu-west-1#LoadBalancers:search=my-alb",
+		},
+		{
+			name:       "Elastic IP address",
+			checkName:  "Unassociated Elastic IP Addresses",
+			resourceID: "54.210.167.204",
+			prettyID:   "54.210.167.204",
+			metadata:   map[string]any{"Region": "us-east-1"},
+			expected:   "https://us-east-1.console.aws.amazon.com/ec2/v2/home?region=us-east-1#Addresses:PublicIp=54.210.167.204",
 		},
 		{
 			name:       "EC2 Instance",

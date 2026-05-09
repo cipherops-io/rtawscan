@@ -4,17 +4,28 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"log"
 	"strings"
 	"sync"
 
 	"github.com/aws/aws-sdk-go-v2/aws"
 	"github.com/aws/aws-sdk-go-v2/config"
+	"github.com/aws/aws-sdk-go-v2/service/iam"
+	"github.com/aws/aws-sdk-go-v2/service/sts"
 	"github.com/aws/aws-sdk-go-v2/service/support"
 	"github.com/aws/aws-sdk-go-v2/service/support/types"
 	"github.com/aws/smithy-go"
 
 	"github.com/cipherops-io/rsvcmodel"
 )
+
+// ScanResult wraps Trusted Advisor findings together with the AWS account
+// context in which they were collected.
+type ScanResult struct {
+	AccountID    string               `json:"accountId"`
+	AccountAlias string               `json:"accountAlias"`
+	Findings     []*rsvcmodel.Finding `json:"findings"`
+}
 
 // isSubscriptionError checks if the given AWS error indicates that the account
 // does not have the required AWS Support subscription plan (Business/Enterprise)
@@ -33,17 +44,22 @@ func isSubscriptionError(err error) bool {
 	return false
 }
 
-// FetchAWS queries the AWS Trusted Advisor API for security, cost, and
-// observability findings. It returns a boolean indicating if Trusted Advisor
-// is enabled (i.e. has the required support subscription), a list of findings,
-// and any non-subscription errors encountered.
-func FetchAWS() (bool, []*rsvcmodel.Finding, error) {
+// FetchTrustedAdvisorFindings queries the AWS Trusted Advisor API for security,
+// cost, and observability findings. It returns a boolean indicating if Trusted
+// Advisor is enabled (i.e. has the required support subscription), a ScanResult
+// containing account context and findings, and any non-subscription errors.
+func FetchTrustedAdvisorFindings() (bool, *ScanResult, error) {
 	trustedAdv := false
 	ctx := context.TODO()
 	cfg, err := config.LoadDefaultConfig(ctx, config.WithRegion("us-east-1"))
 	if err != nil {
 		return trustedAdv, nil, err
 	}
+
+	// Resolve account ID and alias upfront so every finding carries full context.
+	accountID := resolveAccountID(ctx, cfg)
+	accountAlias := resolveAccountAlias(ctx, cfg)
+
 	client := support.NewFromConfig(cfg)
 
 	checksResp, err := client.DescribeTrustedAdvisorChecks(ctx, &support.DescribeTrustedAdvisorChecksInput{
@@ -84,26 +100,20 @@ func FetchAWS() (bool, []*rsvcmodel.Finding, error) {
 			segment := mapCategoryToSegment(category)
 
 			var items []string
-			var resourceIDs []string
 			var links []string
 
 			for _, r := range res.Result.FlaggedResources {
 				rawMeta := make(map[string]any)
-				rawID := aws.ToString(r.ResourceId)
-				isAccessAnalyzer := strings.Contains(checkTitle, "Access Analyzer")
+				rawID := resolveResourceID(c.Metadata, r.Metadata, aws.ToString(r.ResourceId))
 
 				for i, hPtr := range c.Metadata {
 					header := aws.ToString(hPtr)
 					val := aws.ToString(r.Metadata[i])
 					rawMeta[header] = val
-					if isAccessAnalyzer && strings.ToLower(header) == "resource" {
-						rawID = val
-					}
 				}
 
 				prettyID := findPrettyName(c.Metadata, r.Metadata, rawID)
 				items = append(items, prettyID)
-				resourceIDs = append(resourceIDs, rawID)
 				links = append(links, buildDeepLink(checkTitle, rawID, prettyID, rawMeta))
 			}
 
@@ -111,7 +121,6 @@ func FetchAWS() (bool, []*rsvcmodel.Finding, error) {
 			finding.Severity = severity
 			finding.Provider = "aws"
 			finding.Summary = aws.ToString(c.Description)
-			finding.ResourceIDs = resourceIDs
 			finding.Metadata = map[string]any{
 				"links":   links,
 				"service": extractService(checkTitle),
@@ -132,7 +141,77 @@ func FetchAWS() (bool, []*rsvcmodel.Finding, error) {
 		allFindings = append(allFindings, f)
 	}
 
-	return trustedAdv, allFindings, err
+	return trustedAdv, &ScanResult{
+		AccountID:    accountID,
+		AccountAlias: accountAlias,
+		Findings:     allFindings,
+	}, err
+}
+
+// resolveAccountID returns the AWS account ID for the current credentials,
+// or an empty string if the STS call fails.
+func resolveAccountID(ctx context.Context, cfg aws.Config) string {
+	out, err := sts.NewFromConfig(cfg).GetCallerIdentity(ctx, &sts.GetCallerIdentityInput{})
+	if err != nil {
+		log.Printf("[rtawscan] could not resolve account ID via STS: %v", err)
+		return ""
+	}
+	return aws.ToString(out.Account)
+}
+
+// resolveAccountAlias returns the first IAM account alias, or an empty string
+// if the account has no alias set or the IAM call fails (e.g. missing
+// iam:ListAccountAliases permission).
+func resolveAccountAlias(ctx context.Context, cfg aws.Config) string {
+	out, err := iam.NewFromConfig(cfg).ListAccountAliases(ctx, &iam.ListAccountAliasesInput{})
+	if err != nil {
+		log.Printf("[rtawscan] could not resolve account alias via IAM (iam:ListAccountAliases may not be granted): %v", err)
+		return ""
+	}
+	if len(out.AccountAliases) == 0 {
+		return ""
+	}
+	return out.AccountAliases[0]
+}
+
+// knownIDHeaders is an ordered list of lowercase metadata column headers that
+// hold the real AWS resource identifier. The first matching, non-empty value
+// wins over the Trusted Advisor-internal hashed resourceId.
+var knownIDHeaders = []string{
+	"volume id",
+	"instance id",
+	"snapshot id",
+	"ip address",       // Unassociated Elastic IP Addresses
+	"distribution id",
+	"load balancer arn",
+	"load balancer name",
+	"target group arn",
+	"db instance id",
+	"function name",
+	"cluster id",
+	"key id",
+	"resource", // used by Access Analyzer
+}
+
+// resolveResourceID returns the true AWS resource identifier by scanning
+// Trusted Advisor check metadata for well-known ID-bearing column headers.
+// It falls back to fallback (typically the hashed r.ResourceId) when no
+// recognisable value is found.
+func resolveResourceID(headers []*string, metadata []*string, fallback string) string {
+	for i, hPtr := range headers {
+		h := strings.ToLower(aws.ToString(hPtr))
+		for _, known := range knownIDHeaders {
+			if h == known {
+				if i < len(metadata) {
+					val := strings.TrimSpace(aws.ToString(metadata[i]))
+					if val != "" && val != "-" && val != "N/A" {
+						return val
+					}
+				}
+			}
+		}
+	}
+	return fallback
 }
 
 // mapCategoryToSegment maps Trusted Advisor categories to rsvcmodel segments.
@@ -165,6 +244,8 @@ func buildDeepLink(checkName, resourceID, prettyID string, metadata map[string]a
 	switch {
 	case strings.Contains(name, "s3"):
 		return buildS3Link(prettyID, id, region)
+	case strings.Contains(name, "elastic ip"):
+		return buildEIPLink(id, region)
 	case strings.Contains(name, "ec2") || strings.Contains(name, "ebs"):
 		return buildEC2Link(id, region)
 	case strings.Contains(name, "rds"):
@@ -173,8 +254,21 @@ func buildDeepLink(checkName, resourceID, prettyID string, metadata map[string]a
 		return buildIAMLink(prettyID, id, metadata)
 	case strings.Contains(name, "lambda"):
 		return buildLambdaLink(prettyID, id, region)
+	case strings.Contains(name, "target group"):
+		return fmt.Sprintf("https://%s.console.aws.amazon.com/ec2/v2/home?region=%s#TargetGroups:search=%s", region, region, id)
+	case strings.Contains(name, "load balancer"):
+		return fmt.Sprintf("https://%s.console.aws.amazon.com/ec2/v2/home?region=%s#LoadBalancers:search=%s", region, region, id)
 	}
 	return trustedAdvisorURL
+}
+
+// buildEIPLink generates a direct console link to the Elastic IP address page,
+// filtered to the specific public IP.
+func buildEIPLink(ip, region string) string {
+	if ip == "" {
+		return trustedAdvisorURL
+	}
+	return fmt.Sprintf("https://%s.console.aws.amazon.com/ec2/v2/home?region=%s#Addresses:PublicIp=%s", region, region, ip)
 }
 
 // resolveRegion extracts the AWS region from Trusted Advisor metadata,
@@ -211,8 +305,27 @@ func buildARNLink(id, region string) string {
 		if len(parts) > 6 {
 			return fmt.Sprintf("https://%s.console.aws.amazon.com/lambda/home?region=%s#/functions/%s", region, region, parts[6])
 		}
+	case "elasticloadbalancing":
+		return buildELBARNLink(parts[5], region)
 	}
 	return ""
+}
+
+// buildELBARNLink produces a console deep-link from the resource portion of an
+// elasticloadbalancing ARN (parts[5]).
+// Load balancer ARN resource: "loadbalancer/app/<name>/<id>"  → EC2 Load Balancers page filtered by name.
+// Target group ARN resource:  "targetgroup/<name>/<id>"       → EC2 Target Groups page filtered by name.
+func buildELBARNLink(resource, region string) string {
+	segments := strings.Split(resource, "/")
+	switch {
+	case strings.HasPrefix(resource, "loadbalancer/") && len(segments) >= 3:
+		name := segments[2] // loadbalancer/<type>/<name>/<id>
+		return fmt.Sprintf("https://%s.console.aws.amazon.com/ec2/v2/home?region=%s#LoadBalancers:search=%s", region, region, name)
+	case strings.HasPrefix(resource, "targetgroup/") && len(segments) >= 2:
+		name := segments[1] // targetgroup/<name>/<id>
+		return fmt.Sprintf("https://%s.console.aws.amazon.com/ec2/v2/home?region=%s#TargetGroups:search=%s", region, region, name)
+	}
+	return fmt.Sprintf("https://%s.console.aws.amazon.com/ec2/v2/home?region=%s#LoadBalancers:", region, region)
 }
 
 // buildS3Link generates a console link for an S3 bucket.
