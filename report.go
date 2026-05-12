@@ -81,8 +81,8 @@ var regionPattern = regexp.MustCompile(`^[a-z]{2}(-[a-z]+-\d+)$`)
 func findPrettyName(headers []*string, metadata []*string, fallback string) string {
 	for i, hPtr := range headers {
 		h := strings.ToLower(aws.ToString(hPtr))
-		// Skip headers that are clearly region/location fields
-		if strings.Contains(h, "region") || strings.Contains(h, "location") || strings.Contains(h, "zone") || strings.Contains(h, "status") {
+		// Skip headers that are clearly region/location fields or service-limit descriptors.
+		if strings.Contains(h, "region") || strings.Contains(h, "location") || strings.Contains(h, "zone") || strings.Contains(h, "status") || strings.Contains(h, "limit") || strings.Contains(h, "amount") || strings.Contains(h, "usage") || strings.Contains(h, "service") {
 			continue
 		}
 		if i < len(metadata) && (strings.Contains(h, "name") || strings.Contains(h, "user") || strings.Contains(h, "domain") || h == "resource" || strings.Contains(h, "function") || strings.Contains(h, "bucket") || strings.Contains(h, "principal")) {

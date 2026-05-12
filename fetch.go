@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"log"
+	"regexp"
 	"strings"
 	"sync"
 
@@ -121,6 +122,15 @@ func FetchTrustedAdvisorFindings() (bool, *ScanResult, error) {
 					rawID = resolveRegion(rawMeta)
 				}
 
+				// AZ balance checks store the meaningful identifier in an AZ column.
+				// findPrettyName skips all "zone" headers, so we override rawID here so
+				// it becomes the fallback that findPrettyName returns as prettyID.
+				if strings.Contains(strings.ToLower(checkTitle), "availability zone balance") {
+					if az := resolveAZ(rawMeta); az != "" {
+						rawID = az
+					}
+				}
+
 				prettyID := findPrettyName(c.Metadata, r.Metadata, rawID)
 				items = append(items, prettyID)
 				links = append(links, buildDeepLink(checkTitle, rawID, prettyID, rawMeta))
@@ -203,6 +213,7 @@ var knownIDHeaders = []string{
 	"function name",
 	"cluster id",
 	"key id",
+	"security group id",
 	"resource", // used by Access Analyzer
 }
 
@@ -264,6 +275,12 @@ func buildDeepLink(checkName, resourceID, prettyID string, metadata map[string]a
 		return buildS3Link(prettyID, id, region)
 	case strings.Contains(name, "elastic ip"):
 		return buildEIPLink(id, region)
+	case strings.Contains(name, "availability zone balance"):
+		az := id // rawID is the AZ name after the loop override above
+		if az == "" || !strings.Contains(az, "-") {
+			az = region
+		}
+		return fmt.Sprintf("https://%s.console.aws.amazon.com/ec2/v2/home?region=%s#Instances:availabilityZone=%s", region, region, az)
 	case strings.Contains(name, "ec2") || strings.Contains(name, "ebs"):
 		return buildEC2Link(id, region)
 	case strings.Contains(name, "rds"):
@@ -281,7 +298,15 @@ func buildDeepLink(checkName, resourceID, prettyID string, metadata map[string]a
 	case strings.Contains(name, "lambda"):
 		return buildLambdaLink(prettyID, id, region)
 	case strings.Contains(name, "route 53") || strings.Contains(name, "route53"):
-		return buildRoute53Link(id)
+		return buildRoute53Link(prettyID)
+	case strings.Contains(name, "security group") || strings.HasPrefix(id, "sg-"):
+		label := prettyID
+		if label == "" || label == id {
+			label = id
+		}
+		return fmt.Sprintf("https://%s.console.aws.amazon.com/ec2/v2/home?region=%s#SecurityGroups:search=%s", region, region, label)
+	case strings.Contains(name, "vpc endpoint") || strings.HasPrefix(id, "vpce-"):
+		return fmt.Sprintf("https://%s.console.aws.amazon.com/vpc/home?region=%s#Endpoints:vpcEndpointId=%s", region, region, id)
 	case strings.Contains(name, "nat"):
 		return buildNATGatewayLink(id, region)
 	case strings.Contains(name, "target group"):
@@ -320,13 +345,57 @@ func buildNATGatewayLink(id, region string) string {
 	return fmt.Sprintf("https://%s.console.aws.amazon.com/vpc/home?region=%s#NatGateways:natGatewayId=%s", region, region, id)
 }
 
-// buildEIPLink generates a direct console link to the Elastic IP address page,
-// filtered to the specific public IP.
+// buildEIPLink generates a direct console link to the Elastic IP address page.
+// If ip is a real IPv4 address it filters to that specific IP; otherwise it
+// links to the EIPs list for the region (e.g. for service-limit checks where
+// only a hash is available).
 func buildEIPLink(ip, region string) string {
 	if ip == "" {
-		return trustedAdvisorURL
+		return fmt.Sprintf("https://%s.console.aws.amazon.com/ec2/v2/home?region=%s#Addresses:", region, region)
 	}
-	return fmt.Sprintf("https://%s.console.aws.amazon.com/ec2/v2/home?region=%s#Addresses:PublicIp=%s", region, region, ip)
+	if isIPv4(ip) {
+		return fmt.Sprintf("https://%s.console.aws.amazon.com/ec2/v2/home?region=%s#Addresses:PublicIp=%s", region, region, ip)
+	}
+	return fmt.Sprintf("https://%s.console.aws.amazon.com/ec2/v2/home?region=%s#Addresses:", region, region)
+}
+
+// isIPv4 returns true when s looks like a dotted-decimal IPv4 address.
+func isIPv4(s string) bool {
+	parts := strings.Split(s, ".")
+	if len(parts) != 4 {
+		return false
+	}
+	for _, p := range parts {
+		if len(p) == 0 || len(p) > 3 {
+			return false
+		}
+		for _, c := range p {
+			if c < '0' || c > '9' {
+				return false
+			}
+		}
+	}
+	return true
+}
+
+// azPattern matches a single AWS availability zone (e.g. us-east-1a, ap-southeast-2b).
+var azPattern = regexp.MustCompile(`^[a-z]{2}-[a-z]+-\d+[a-z]$`)
+
+// resolveAZ extracts an availability zone from Trusted Advisor metadata by trying
+// known column headers first, then scanning all values for an AZ-shaped string.
+func resolveAZ(metadata map[string]any) string {
+	for _, k := range []string{"Availability Zone", "availability zone", "AZ", "Zone"} {
+		if val, ok := metadata[k].(string); ok && azPattern.MatchString(strings.TrimSpace(val)) {
+			return strings.TrimSpace(val)
+		}
+	}
+	// Scan all values — Trusted Advisor column names vary across check versions.
+	for _, v := range metadata {
+		if s, ok := v.(string); ok && azPattern.MatchString(strings.TrimSpace(s)) {
+			return strings.TrimSpace(s)
+		}
+	}
+	return ""
 }
 
 // resolveRegion extracts the AWS region from Trusted Advisor metadata,
