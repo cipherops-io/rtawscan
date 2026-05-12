@@ -112,6 +112,15 @@ func FetchTrustedAdvisorFindings() (bool, *ScanResult, error) {
 					rawMeta[header] = val
 				}
 
+				// Stamp the category so buildDeepLink can branch on it.
+				rawMeta["_category"] = category
+
+				// Service-limit checks have no per-resource AWS ID — the meaningful
+				// identifier is the region (one quota entry per region).
+				if category == "service_limits" {
+					rawID = resolveRegion(rawMeta)
+				}
+
 				prettyID := findPrettyName(c.Metadata, r.Metadata, rawID)
 				items = append(items, prettyID)
 				links = append(links, buildDeepLink(checkTitle, rawID, prettyID, rawMeta))
@@ -181,7 +190,11 @@ var knownIDHeaders = []string{
 	"volume id",
 	"instance id",
 	"snapshot id",
+	"nat gateway id",
 	"ip address",       // Unassociated Elastic IP Addresses
+	"principal arn",    // STS / IAM principal checks
+	"principal",
+	"hosted zone name", // Route 53 checks
 	"distribution id",
 	"load balancer arn",
 	"load balancer name",
@@ -236,6 +249,11 @@ func buildDeepLink(checkName, resourceID, prettyID string, metadata map[string]a
 	region := resolveRegion(metadata)
 	id := resourceID
 
+	// Service-limit checks: rawID is the region; link to Service Quotas for that region.
+	if cat, _ := metadata["_category"].(string); cat == "service_limits" {
+		return fmt.Sprintf("https://%s.console.aws.amazon.com/servicequotas/home", region)
+	}
+
 	if link := buildARNLink(id, region); link != "" {
 		return link
 	}
@@ -250,16 +268,56 @@ func buildDeepLink(checkName, resourceID, prettyID string, metadata map[string]a
 		return buildEC2Link(id, region)
 	case strings.Contains(name, "rds"):
 		return fmt.Sprintf("https://%s.console.aws.amazon.com/rds/home?region=%s#database:id=%s", region, region, id)
-	case strings.Contains(name, "iam"):
+	case strings.Contains(name, "access analyzer"):
+		// Each item is a region where the analyzer is missing; link directly to
+		// the Access Analyzer console for that region.
+		analyzerRegion := id // rawID is the region for this check type
+		if analyzerRegion == "" || !strings.Contains(analyzerRegion, "-") {
+			analyzerRegion = region
+		}
+		return fmt.Sprintf("https://%s.console.aws.amazon.com/access-analyzer/home?region=%s#/analyzer", analyzerRegion, analyzerRegion)
+	case strings.Contains(name, "iam") || strings.Contains(name, "sts"):
 		return buildIAMLink(prettyID, id, metadata)
 	case strings.Contains(name, "lambda"):
 		return buildLambdaLink(prettyID, id, region)
+	case strings.Contains(name, "route 53") || strings.Contains(name, "route53"):
+		return buildRoute53Link(id)
+	case strings.Contains(name, "nat"):
+		return buildNATGatewayLink(id, region)
 	case strings.Contains(name, "target group"):
-		return fmt.Sprintf("https://%s.console.aws.amazon.com/ec2/v2/home?region=%s#TargetGroups:search=%s", region, region, id)
-	case strings.Contains(name, "load balancer"):
-		return fmt.Sprintf("https://%s.console.aws.amazon.com/ec2/v2/home?region=%s#LoadBalancers:search=%s", region, region, id)
+		label := prettyID
+		if label == "" || label == id {
+			label = id
+		}
+		return fmt.Sprintf("https://%s.console.aws.amazon.com/ec2/v2/home?region=%s#TargetGroups:search=%s", region, region, label)
+	case strings.Contains(name, "load balancer") || strings.Contains(name, "elb"):
+		label := prettyID
+		if label == "" || label == id {
+			label = id
+		}
+		return fmt.Sprintf("https://%s.console.aws.amazon.com/ec2/v2/home?region=%s#LoadBalancers:search=%s", region, region, label)
 	}
 	return trustedAdvisorURL
+}
+
+// buildRoute53Link generates a console link to the Route 53 hosted zones page.
+// If a domain name is available (e.g. "darknoc.gocommotion.com."), the trailing
+// dot is stripped and the domain is used to pre-filter the hosted zones list.
+func buildRoute53Link(domain string) string {
+	domain = strings.TrimSuffix(strings.TrimSpace(domain), ".")
+	if domain == "" {
+		return "https://console.aws.amazon.com/route53/v2/hostedzones"
+	}
+	return fmt.Sprintf("https://console.aws.amazon.com/route53/v2/hostedzones#?searchFilter=%s", domain)
+}
+
+// buildNATGatewayLink generates a console link to the VPC NAT Gateways page
+// filtered to the specific gateway ID.
+func buildNATGatewayLink(id, region string) string {
+	if id == "" {
+		return trustedAdvisorURL
+	}
+	return fmt.Sprintf("https://%s.console.aws.amazon.com/vpc/home?region=%s#NatGateways:natGatewayId=%s", region, region, id)
 }
 
 // buildEIPLink generates a direct console link to the Elastic IP address page,
