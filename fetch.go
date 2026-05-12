@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"log"
+	"regexp"
 	"strings"
 	"sync"
 
@@ -112,6 +113,24 @@ func FetchTrustedAdvisorFindings() (bool, *ScanResult, error) {
 					rawMeta[header] = val
 				}
 
+				// Stamp the category so buildDeepLink can branch on it.
+				rawMeta["_category"] = category
+
+				// Service-limit checks have no per-resource AWS ID — the meaningful
+				// identifier is the region (one quota entry per region).
+				if category == "service_limits" {
+					rawID = resolveRegion(rawMeta)
+				}
+
+				// AZ balance checks store the meaningful identifier in an AZ column.
+				// findPrettyName skips all "zone" headers, so we override rawID here so
+				// it becomes the fallback that findPrettyName returns as prettyID.
+				if strings.Contains(strings.ToLower(checkTitle), "availability zone balance") {
+					if az := resolveAZ(rawMeta); az != "" {
+						rawID = az
+					}
+				}
+
 				prettyID := findPrettyName(c.Metadata, r.Metadata, rawID)
 				items = append(items, prettyID)
 				links = append(links, buildDeepLink(checkTitle, rawID, prettyID, rawMeta))
@@ -181,7 +200,11 @@ var knownIDHeaders = []string{
 	"volume id",
 	"instance id",
 	"snapshot id",
+	"nat gateway id",
 	"ip address",       // Unassociated Elastic IP Addresses
+	"principal arn",    // STS / IAM principal checks
+	"principal",
+	"hosted zone name", // Route 53 checks
 	"distribution id",
 	"load balancer arn",
 	"load balancer name",
@@ -190,6 +213,7 @@ var knownIDHeaders = []string{
 	"function name",
 	"cluster id",
 	"key id",
+	"security group id",
 	"resource", // used by Access Analyzer
 }
 
@@ -236,6 +260,11 @@ func buildDeepLink(checkName, resourceID, prettyID string, metadata map[string]a
 	region := resolveRegion(metadata)
 	id := resourceID
 
+	// Service-limit checks: rawID is the region; link to Service Quotas for that region.
+	if cat, _ := metadata["_category"].(string); cat == "service_limits" {
+		return fmt.Sprintf("https://%s.console.aws.amazon.com/servicequotas/home", region)
+	}
+
 	if link := buildARNLink(id, region); link != "" {
 		return link
 	}
@@ -246,29 +275,127 @@ func buildDeepLink(checkName, resourceID, prettyID string, metadata map[string]a
 		return buildS3Link(prettyID, id, region)
 	case strings.Contains(name, "elastic ip"):
 		return buildEIPLink(id, region)
+	case strings.Contains(name, "availability zone balance"):
+		az := id // rawID is the AZ name after the loop override above
+		if az == "" || !strings.Contains(az, "-") {
+			az = region
+		}
+		return fmt.Sprintf("https://%s.console.aws.amazon.com/ec2/v2/home?region=%s#Instances:availabilityZone=%s", region, region, az)
 	case strings.Contains(name, "ec2") || strings.Contains(name, "ebs"):
 		return buildEC2Link(id, region)
 	case strings.Contains(name, "rds"):
 		return fmt.Sprintf("https://%s.console.aws.amazon.com/rds/home?region=%s#database:id=%s", region, region, id)
-	case strings.Contains(name, "iam"):
+	case strings.Contains(name, "access analyzer"):
+		// Each item is a region where the analyzer is missing; link directly to
+		// the Access Analyzer console for that region.
+		analyzerRegion := id // rawID is the region for this check type
+		if analyzerRegion == "" || !strings.Contains(analyzerRegion, "-") {
+			analyzerRegion = region
+		}
+		return fmt.Sprintf("https://%s.console.aws.amazon.com/access-analyzer/home?region=%s#/analyzer", analyzerRegion, analyzerRegion)
+	case strings.Contains(name, "iam") || strings.Contains(name, "sts"):
 		return buildIAMLink(prettyID, id, metadata)
 	case strings.Contains(name, "lambda"):
 		return buildLambdaLink(prettyID, id, region)
+	case strings.Contains(name, "route 53") || strings.Contains(name, "route53"):
+		return buildRoute53Link(prettyID)
+	case strings.Contains(name, "security group") || strings.HasPrefix(id, "sg-"):
+		label := prettyID
+		if label == "" || label == id {
+			label = id
+		}
+		return fmt.Sprintf("https://%s.console.aws.amazon.com/ec2/v2/home?region=%s#SecurityGroups:search=%s", region, region, label)
+	case strings.Contains(name, "vpc endpoint") || strings.HasPrefix(id, "vpce-"):
+		return fmt.Sprintf("https://%s.console.aws.amazon.com/vpc/home?region=%s#Endpoints:vpcEndpointId=%s", region, region, id)
+	case strings.Contains(name, "nat"):
+		return buildNATGatewayLink(id, region)
 	case strings.Contains(name, "target group"):
-		return fmt.Sprintf("https://%s.console.aws.amazon.com/ec2/v2/home?region=%s#TargetGroups:search=%s", region, region, id)
-	case strings.Contains(name, "load balancer"):
-		return fmt.Sprintf("https://%s.console.aws.amazon.com/ec2/v2/home?region=%s#LoadBalancers:search=%s", region, region, id)
+		label := prettyID
+		if label == "" || label == id {
+			label = id
+		}
+		return fmt.Sprintf("https://%s.console.aws.amazon.com/ec2/v2/home?region=%s#TargetGroups:search=%s", region, region, label)
+	case strings.Contains(name, "load balancer") || strings.Contains(name, "elb"):
+		label := prettyID
+		if label == "" || label == id {
+			label = id
+		}
+		return fmt.Sprintf("https://%s.console.aws.amazon.com/ec2/v2/home?region=%s#LoadBalancers:search=%s", region, region, label)
 	}
 	return trustedAdvisorURL
 }
 
-// buildEIPLink generates a direct console link to the Elastic IP address page,
-// filtered to the specific public IP.
-func buildEIPLink(ip, region string) string {
-	if ip == "" {
+// buildRoute53Link generates a console link to the Route 53 hosted zones page.
+// If a domain name is available (e.g. "darknoc.gocommotion.com."), the trailing
+// dot is stripped and the domain is used to pre-filter the hosted zones list.
+func buildRoute53Link(domain string) string {
+	domain = strings.TrimSuffix(strings.TrimSpace(domain), ".")
+	if domain == "" {
+		return "https://console.aws.amazon.com/route53/v2/hostedzones"
+	}
+	return fmt.Sprintf("https://console.aws.amazon.com/route53/v2/hostedzones#?searchFilter=%s", domain)
+}
+
+// buildNATGatewayLink generates a console link to the VPC NAT Gateways page
+// filtered to the specific gateway ID.
+func buildNATGatewayLink(id, region string) string {
+	if id == "" {
 		return trustedAdvisorURL
 	}
-	return fmt.Sprintf("https://%s.console.aws.amazon.com/ec2/v2/home?region=%s#Addresses:PublicIp=%s", region, region, ip)
+	return fmt.Sprintf("https://%s.console.aws.amazon.com/vpc/home?region=%s#NatGateways:natGatewayId=%s", region, region, id)
+}
+
+// buildEIPLink generates a direct console link to the Elastic IP address page.
+// If ip is a real IPv4 address it filters to that specific IP; otherwise it
+// links to the EIPs list for the region (e.g. for service-limit checks where
+// only a hash is available).
+func buildEIPLink(ip, region string) string {
+	if ip == "" {
+		return fmt.Sprintf("https://%s.console.aws.amazon.com/ec2/v2/home?region=%s#Addresses:", region, region)
+	}
+	if isIPv4(ip) {
+		return fmt.Sprintf("https://%s.console.aws.amazon.com/ec2/v2/home?region=%s#Addresses:PublicIp=%s", region, region, ip)
+	}
+	return fmt.Sprintf("https://%s.console.aws.amazon.com/ec2/v2/home?region=%s#Addresses:", region, region)
+}
+
+// isIPv4 returns true when s looks like a dotted-decimal IPv4 address.
+func isIPv4(s string) bool {
+	parts := strings.Split(s, ".")
+	if len(parts) != 4 {
+		return false
+	}
+	for _, p := range parts {
+		if len(p) == 0 || len(p) > 3 {
+			return false
+		}
+		for _, c := range p {
+			if c < '0' || c > '9' {
+				return false
+			}
+		}
+	}
+	return true
+}
+
+// azPattern matches a single AWS availability zone (e.g. us-east-1a, ap-southeast-2b).
+var azPattern = regexp.MustCompile(`^[a-z]{2}-[a-z]+-\d+[a-z]$`)
+
+// resolveAZ extracts an availability zone from Trusted Advisor metadata by trying
+// known column headers first, then scanning all values for an AZ-shaped string.
+func resolveAZ(metadata map[string]any) string {
+	for _, k := range []string{"Availability Zone", "availability zone", "AZ", "Zone"} {
+		if val, ok := metadata[k].(string); ok && azPattern.MatchString(strings.TrimSpace(val)) {
+			return strings.TrimSpace(val)
+		}
+	}
+	// Scan all values — Trusted Advisor column names vary across check versions.
+	for _, v := range metadata {
+		if s, ok := v.(string); ok && azPattern.MatchString(strings.TrimSpace(s)) {
+			return strings.TrimSpace(s)
+		}
+	}
+	return ""
 }
 
 // resolveRegion extracts the AWS region from Trusted Advisor metadata,
